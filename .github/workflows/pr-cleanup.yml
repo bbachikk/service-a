@@ -1,0 +1,21 @@
+name: PR cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-cleanup-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    uses: ./.github/workflows/cleanup-preview.yml
+    with:
+      repo: service-a
+      pr: ${{ github.event.pull_request.number }}
+    secrets: inherit

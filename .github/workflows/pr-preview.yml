@@ -1,0 +1,57 @@
+name: PR preview
+
+on:
+  pull_request:
+    # labeled/unlabeled matter: adding preview:<name> moves this PR into a
+    # shared stack, which requires recomputing and redeploying.
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+concurrency:
+  # Per-PR: a new push supersedes an in-flight build of the same PR.
+  group: pr-preview-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push PR image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # pr-<n> is the moving tag the deployer references; sha-<sha> gives an
+          # immutable handle for debugging which commit a container came from.
+          tags: |
+            ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+            ghcr.io/${{ github.repository }}:sha-${{ github.event.pull_request.head.sha }}
+          build-args: |
+            IMAGE_TAG=pr-${{ github.event.pull_request.number }}
+            GIT_SHA=${{ github.event.pull_request.head.sha }}
+            GIT_REF=${{ github.event.pull_request.head.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/deploy-preview.yml
+    with:
+      repo: service-a
+      pr: ${{ github.event.pull_request.number }}
+    secrets: inherit

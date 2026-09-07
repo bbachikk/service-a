@@ -1,0 +1,42 @@
+name: Build main image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-main-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # This :main tag is what every other repo's preview pulls for the
+      # services that have no PR in the stack.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:main
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          build-args: |
+            IMAGE_TAG=main
+            GIT_SHA=${{ github.sha }}
+            GIT_REF=main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

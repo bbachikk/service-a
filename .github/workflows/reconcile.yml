@@ -1,0 +1,66 @@
+# Safety net. Even if every cleanup workflow failed, this brings the server
+# back in line with reality: any prev-* stack without a matching open PR is
+# destroyed, and stacks idle beyond MAX_AGE_HOURS are dropped too.
+name: Reconcile previews
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: Destroy stacks not deployed within this many hours
+        type: string
+        default: "72"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPOS: service-a,service-b,service-c
+      HETZNER_USER: preview
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: infra
+          sparse-checkout-cone-mode: false
+
+      - name: Compute desired state
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          node infra/plan/plan.mjs > plan.json
+          echo "desired=$(jq -r '.all_stack_ids | join(" ")' plan.json)" >> "$GITHUB_OUTPUT"
+          jq -r '"Open PR stacks: " + (.all_stack_ids | length | tostring)' plan.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/preview_key
+          chmod 600 ~/.ssh/preview_key
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Reap orphaned stacks
+        env:
+          DESIRED: ${{ steps.plan.outputs.desired }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/preview_key "$HETZNER_USER@${{ secrets.HETZNER_HOST }}" \
+            "ALLOW_EMPTY=true MAX_AGE_HOURS='${{ inputs.max_age_hours || 72 }}' /opt/preview/bin/reap.sh '$DESIRED'" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Report capacity
+        run: |
+          ssh -i ~/.ssh/preview_key "$HETZNER_USER@${{ secrets.HETZNER_HOST }}" \
+            "/opt/preview/bin/capacity.sh" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,221 @@
+# Reusable deploy workflow. service-b and service-c call this same file, so the
+# grouping and deployment logic exists in exactly one place.
+name: deploy-preview
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: Repository that triggered the deploy (service-a|service-b|service-c)
+        type: string
+        required: true
+      pr:
+        description: Pull request number
+        type: number
+        required: true
+    secrets:
+      HETZNER_HOST: { required: true }
+      HETZNER_SSH_KEY: { required: true }
+      PREVIEW_GH_TOKEN: { required: true }
+
+env:
+  OWNER: ${{ github.repository_owner }}
+  REPOS: service-a,service-b,service-c
+  HETZNER_USER: preview
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      stack_id: ${{ steps.plan.outputs.stack_id }}
+      env_file: ${{ steps.plan.outputs.env_file }}
+      summary: ${{ steps.plan.outputs.summary }}
+      all_stacks: ${{ steps.plan.outputs.all_stacks }}
+      warnings: ${{ steps.plan.outputs.warnings }}
+    steps:
+      - name: Checkout infra from service-a
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/service-a
+          ref: main
+          sparse-checkout: infra
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve stack composition
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          PREVIEW_DOMAIN: ${{ vars.PREVIEW_DOMAIN }}
+        run: |
+          set -euo pipefail
+          node infra/plan/plan.mjs --for "${{ inputs.repo }}#${{ inputs.pr }}" > plan.json
+          cat plan.json
+
+          stack_id=$(jq -r '.stack.id // empty' plan.json)
+          if [[ -z "$stack_id" ]]; then
+            echo "PR is closed or excluded from previews; nothing to deploy" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "stack_id=$stack_id" >> "$GITHUB_OUTPUT"
+          echo "all_stacks=$(jq -r '.all_stack_ids | join(" ")' plan.json)" >> "$GITHUB_OUTPUT"
+          echo "warnings=$(jq -r '.stack.warnings | join("; ")' plan.json)" >> "$GITHUB_OUTPUT"
+
+          # Render the .env consumed by preview.yml. Image tags for the other
+          # repos come straight from the plan: pr-<n> when a PR of theirs is in
+          # this group, main otherwise.
+          {
+            echo "STACK_ID=$stack_id"
+            echo "PREVIEW_DOMAIN=${PREVIEW_DOMAIN}"
+            for repo in service-a service-b service-c; do
+              letter="${repo#service-}"
+              upper=$(echo "$letter" | tr '[:lower:]' '[:upper:]')
+              tag=$(jq -r --arg r "$repo" '.stack.services[$r].tag' plan.json)
+              ref=$(jq -r --arg r "$repo" '.stack.services[$r].ref' plan.json)
+              sha=$(jq -r --arg r "$repo" '.stack.services[$r].sha' plan.json)
+              echo "IMAGE_${upper}=ghcr.io/${OWNER,,}/${repo}:${tag}"
+              echo "TAG_${upper}=${tag}"
+              echo "REF_${upper}=${ref}"
+              echo "SHA_${upper}=${sha}"
+            done
+          } > stack.env
+          cat stack.env
+
+          {
+            echo "env_file<<EOF"
+            cat stack.env
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "summary<<EOF"
+            jq -r '.stack.services | to_entries[] | "| \(.key) | `\(.value.tag)` | \(.value.source) |"' plan.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for images to exist
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A shared stack can be triggered by repo A while repo B is still
+          # building its PR image. Poll instead of failing the deploy.
+          echo "${{ steps.plan.outputs.env_file }}" | grep '^IMAGE_' | while read -r line; do
+            image="${line#*=}"
+            for attempt in $(seq 1 30); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                echo "found $image"; break
+              fi
+              if (( attempt == 30 )); then
+                echo "::error::image $image never appeared after 5 minutes"; exit 1
+              fi
+              echo "waiting for $image (attempt $attempt)"; sleep 10
+            done
+          done
+        continue-on-error: false
+
+  deploy:
+    needs: plan
+    runs-on: ubuntu-latest
+    # One deploy at a time per stack. When service-a #10 and service-b #20 share
+    # a label they resolve to the same stack id and therefore the same
+    # concurrency group, so their deploys queue instead of racing.
+    # cancel-in-progress stays false: a half-applied stack is worse than a wait.
+    concurrency:
+      group: preview-${{ needs.plan.outputs.stack_id }}
+      cancel-in-progress: false
+    environment:
+      name: preview
+      url: http://a-${{ needs.plan.outputs.stack_id }}.${{ vars.PREVIEW_DOMAIN }}
+    steps:
+      - name: Checkout infra from service-a
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/service-a
+          ref: main
+          sparse-checkout: infra
+          sparse-checkout-cone-mode: false
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/preview_key
+          chmod 600 ~/.ssh/preview_key
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Ship stack definition
+        env:
+          STACK_ID: ${{ needs.plan.outputs.stack_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp infra/compose/preview.yml out/preview.yml
+          echo "${{ needs.plan.outputs.env_file }}" > out/.env
+
+          ssh -i ~/.ssh/preview_key "$HETZNER_USER@${{ secrets.HETZNER_HOST }}" \
+            "mkdir -p /opt/preview/stacks/$STACK_ID"
+          scp -i ~/.ssh/preview_key out/preview.yml out/.env \
+            "$HETZNER_USER@${{ secrets.HETZNER_HOST }}:/opt/preview/stacks/$STACK_ID/"
+
+      - name: Deploy stack
+        env:
+          STACK_ID: ${{ needs.plan.outputs.stack_id }}
+        run: |
+          ssh -i ~/.ssh/preview_key "$HETZNER_USER@${{ secrets.HETZNER_HOST }}" \
+            "/opt/preview/bin/deploy.sh $STACK_ID"
+
+      - name: Smoke test
+        env:
+          STACK_ID: ${{ needs.plan.outputs.stack_id }}
+        run: |
+          set -euo pipefail
+          base="http://a-${STACK_ID}.${{ vars.PREVIEW_DOMAIN }}"
+          for attempt in $(seq 1 20); do
+            if curl -fsS --max-time 5 "$base/healthz" >/dev/null; then
+              echo "preview is serving traffic"
+              curl -fsS "$base/api/info" | jq .
+              exit 0
+            fi
+            echo "waiting for routing (attempt $attempt)"; sleep 5
+          done
+          echo "::error::preview did not become reachable through Traefik"
+          exit 1
+
+      - name: Comment preview URLs on the PR
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          STACK_ID: ${{ needs.plan.outputs.stack_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Preview environment ready"
+            echo
+            echo "Stack \`$STACK_ID\` · [open service-a](http://a-$STACK_ID.${{ vars.PREVIEW_DOMAIN }})"
+            echo
+            echo "| service | image tag | source |"
+            echo "|---|---|---|"
+            echo "${{ needs.plan.outputs.summary }}"
+            echo
+            echo "- service-a: http://a-$STACK_ID.${{ vars.PREVIEW_DOMAIN }}"
+            echo "- service-b: http://b-$STACK_ID.${{ vars.PREVIEW_DOMAIN }}"
+            echo "- service-c: http://c-$STACK_ID.${{ vars.PREVIEW_DOMAIN }}"
+            echo
+            echo "Add the label \`preview:<name>\` to PRs in different repos to merge them into one shared stack."
+            if [[ -n "${{ needs.plan.outputs.warnings }}" ]]; then
+              echo
+              echo "> [!WARNING]"
+              echo "> ${{ needs.plan.outputs.warnings }}"
+            fi
+          } > comment.md
+
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Update the existing bot comment instead of adding a new one on every push.
+          existing=$(gh api "repos/${{ github.repository }}/issues/${{ inputs.pr }}/comments" \
+            --jq '[.[] | select(.body | startswith("### Preview environment ready"))][0].id // empty')
+          if [[ -n "$existing" ]]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" -F body=@comment.md
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${{ inputs.pr }}/comments" -F body=@comment.md
+          fi

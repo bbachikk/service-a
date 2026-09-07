@@ -1,0 +1,101 @@
+# Reusable cleanup. Called when a PR closes in any of the three repos.
+#
+# Closing a PR does not always mean destroying a stack: if the PR was part of a
+# shared group and other PRs in that group are still open, the stack must stay
+# up and simply fall back to main for this service. The planner already
+# encodes that rule, so cleanup just asks it what should exist now.
+name: cleanup-preview
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        type: string
+        required: true
+      pr:
+        type: number
+        required: true
+    secrets:
+      HETZNER_HOST: { required: true }
+      HETZNER_SSH_KEY: { required: true }
+      PREVIEW_GH_TOKEN: { required: true }
+
+env:
+  OWNER: ${{ github.repository_owner }}
+  REPOS: service-a,service-b,service-c
+  HETZNER_USER: preview
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infra from service-a
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/service-a
+          ref: main
+          sparse-checkout: infra
+          sparse-checkout-cone-mode: false
+
+      - name: Recompute desired state
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The PR is already closed, so it no longer appears in the plan.
+          node infra/plan/plan.mjs > plan.json
+          desired=$(jq -r '.all_stack_ids | join(" ")' plan.json)
+          echo "desired=$desired" >> "$GITHUB_OUTPUT"
+          echo "Desired stacks after close: ${desired:-<none>}" >> "$GITHUB_STEP_SUMMARY"
+
+          # Which stack did this PR belong to? Solo PRs use a derived id.
+          letter=$(echo "${{ inputs.repo }}" | sed 's/^service-//')
+          echo "solo_stack=${letter}-pr-${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/preview_key
+          chmod 600 ~/.ssh/preview_key
+          ssh-keyscan -H "${{ secrets.HETZNER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Destroy orphaned stacks and refresh survivors
+        env:
+          DESIRED: ${{ steps.plan.outputs.desired }}
+        run: |
+          set -euo pipefail
+          # reap.sh destroys every prev-* project that is not in the desired
+          # list, which covers both the solo stack of this PR and any shared
+          # stack whose last PR just closed. ALLOW_EMPTY is set because closing
+          # the final PR legitimately leaves zero stacks.
+          ssh -i ~/.ssh/preview_key "$HETZNER_USER@${{ secrets.HETZNER_HOST }}" \
+            "ALLOW_EMPTY=true /opt/preview/bin/reap.sh '$DESIRED'"
+
+      - name: Re-deploy shared stack without this PR
+        if: contains(steps.plan.outputs.desired, 'g-')
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A surviving shared stack still references pr-<n> of the closed PR.
+          # Trigger its remaining PRs so the planner swaps that service to main.
+          jq -c '.stacks[] | select(.shared)' plan.json | while read -r stack; do
+            id=$(jq -r '.id' <<<"$stack")
+            first_repo=$(jq -r '.prs[0].repo' <<<"$stack")
+            first_pr=$(jq -r '.prs[0].number' <<<"$stack")
+            echo "refreshing shared stack $id via $first_repo#$first_pr"
+            gh workflow run pr-preview.yml \
+              --repo "${OWNER}/${first_repo}" \
+              --ref main 2>/dev/null || \
+            gh api -X POST "repos/${OWNER}/${first_repo}/issues/${first_pr}/comments" \
+              -f body="Group member closed; this stack now falls back to \`main\` for that service. Push or re-label to refresh." >/dev/null
+          done
+
+      - name: Report
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/issues/${{ inputs.pr }}/comments" \
+            -f body="Preview environment for this PR has been destroyed (containers, network, volumes and database removed)." >/dev/null

@@ -1,0 +1,183 @@
+# One Compose file describes an entire preview stack: all three services plus
+# their own Postgres and Redis. Every stack is launched with a different
+# Compose project name (-p prev-<stack>), which gives each PR its own
+# containers, network, volumes and database with no extra configuration.
+#
+# Required env (supplied by .env rendered from GitHub Actions):
+#   STACK_ID, PREVIEW_DOMAIN, IMAGE_A, IMAGE_B, IMAGE_C,
+#   TAG_A, TAG_B, TAG_C, REF_A, REF_B, REF_C, SHA_A, SHA_B, SHA_C,
+#   POSTGRES_PASSWORD
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  pull_policy: always
+  # Hard caps keep one runaway preview from starving its neighbours.
+  deploy:
+    resources:
+      limits:
+        cpus: "0.50"
+        memory: 256M
+      reservations:
+        memory: 64M
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  healthcheck:
+    test:
+      - CMD
+      - node
+      - -e
+      - "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
+x-app-env: &app-env
+  STACK_ID: ${STACK_ID}
+  PORT: "3000"
+  PG_HOST: postgres
+  PG_PORT: "5432"
+  PG_DATABASE: app
+  PGUSER: app
+  PGPASSWORD: ${POSTGRES_PASSWORD}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+
+services:
+  service-a:
+    <<: *service-defaults
+    image: ${IMAGE_A}
+    environment:
+      <<: *app-env
+      SERVICE_NAME: service-a
+      SERVICE_ROLE: web
+      IMAGE_TAG: ${TAG_A}
+      GIT_REF: ${REF_A}
+      GIT_SHA: ${SHA_A}
+      PEERS: service-b=http://service-b:3000,service-c=http://service-c:3000
+    networks: [edge, data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # List form, not mapping form: Compose only interpolates ${VARS} in label
+    # values, so a mapping key like `routers.${STACK_ID}-a.rule` would reach
+    # Traefik with the literal text ${STACK_ID} and be silently ignored.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=prev-${STACK_ID}_edge
+      - traefik.http.routers.${STACK_ID}-a.rule=Host(`a-${STACK_ID}.${PREVIEW_DOMAIN}`)
+      - traefik.http.routers.${STACK_ID}-a.entrypoints=web
+      - traefik.http.services.${STACK_ID}-a.loadbalancer.server.port=3000
+      - traefik.http.services.${STACK_ID}-a.loadbalancer.healthcheck.path=/healthz
+      - traefik.http.services.${STACK_ID}-a.loadbalancer.healthcheck.interval=10s
+      - preview.stack=${STACK_ID}
+
+  service-b:
+    <<: *service-defaults
+    image: ${IMAGE_B}
+    environment:
+      <<: *app-env
+      SERVICE_NAME: service-b
+      SERVICE_ROLE: api
+      IMAGE_TAG: ${TAG_B}
+      GIT_REF: ${REF_B}
+      GIT_SHA: ${SHA_B}
+    networks: [edge, data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=prev-${STACK_ID}_edge
+      - traefik.http.routers.${STACK_ID}-b.rule=Host(`b-${STACK_ID}.${PREVIEW_DOMAIN}`)
+      - traefik.http.routers.${STACK_ID}-b.entrypoints=web
+      - traefik.http.services.${STACK_ID}-b.loadbalancer.server.port=3000
+      - preview.stack=${STACK_ID}
+
+  service-c:
+    <<: *service-defaults
+    image: ${IMAGE_C}
+    environment:
+      <<: *app-env
+      SERVICE_NAME: service-c
+      SERVICE_ROLE: worker
+      IMAGE_TAG: ${TAG_C}
+      GIT_REF: ${REF_C}
+      GIT_SHA: ${SHA_C}
+    networks: [edge, data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=prev-${STACK_ID}_edge
+      - traefik.http.routers.${STACK_ID}-c.rule=Host(`c-${STACK_ID}.${PREVIEW_DOMAIN}`)
+      - traefik.http.routers.${STACK_ID}-c.entrypoints=web
+      - traefik.http.services.${STACK_ID}-c.loadbalancer.server.port=3000
+      - preview.stack=${STACK_ID}
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: app
+    # No ports published: the database is reachable only from this stack's data network.
+    networks: [data]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    labels:
+      - preview.stack=${STACK_ID}
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "96mb", "--maxmemory-policy", "allkeys-lru"]
+    networks: [data]
+    volumes:
+      - redisdata:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    labels:
+      - preview.stack=${STACK_ID}
+
+networks:
+  # One edge network per stack, not a shared one. Compose registers every
+  # service under its own name (service-b) in every network it joins, so a
+  # single shared edge network would put two containers named service-b in the
+  # same DNS zone and stack A would randomly resolve stack B's service-b.
+  # deploy.sh attaches Traefik to this network after the stack comes up.
+  edge:
+    name: prev-${STACK_ID}_edge
+    driver: bridge
+  # internal: true means no route to the internet and no route to any other
+  # stack — this is what keeps a preview from ever reaching the production DB.
+  data:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
