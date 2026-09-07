@@ -71,7 +71,10 @@ PUBLIC_IP="$(curl -fsS https://ipv4.icanhazip.com | tr -d '\n')"
 # the PR number as the first octet. Dashes remove the ambiguity.
 PREVIEW_DOMAIN="${PREVIEW_DOMAIN:-${PUBLIC_IP//./-}.sslip.io}"
 DASHBOARD_PASS="$(openssl rand -hex 12)"
-DASHBOARD_AUTH="$(htpasswd -nbB admin "$DASHBOARD_PASS" | sed -e 's/\$/\$\$/g')"
+# No $-doubling here: escaping is only needed for literals written inside a
+# compose file. Values coming from .env are substituted verbatim, so doubling
+# would corrupt the bcrypt hash and make the dashboard reject every password.
+DASHBOARD_AUTH="$(htpasswd -nbB admin "$DASHBOARD_PASS")"
 
 echo "==> fetching infra files"
 for script in deploy.sh destroy.sh reap.sh capacity.sh list-stacks.sh; do

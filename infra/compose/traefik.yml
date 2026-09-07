@@ -3,7 +3,7 @@
 
 services:
   traefik:
-    image: traefik:v3.3
+    image: traefik:v3.6
     restart: unless-stopped
     command:
       - --providers.docker=true
@@ -32,6 +32,10 @@ services:
     environment:
       # - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
       TZ: UTC
+      # Traefik's Docker client pins an old API version by default. Docker 29
+      # refuses anything below 1.40, which silently breaks container discovery
+      # (every request 404s because no router is ever created).
+      DOCKER_API_VERSION: "1.44"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
