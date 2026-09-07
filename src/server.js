@@ -3,6 +3,7 @@
 const http = require("node:http");
 const net = require("node:net");
 
+// touched by the first preview test
 const SERVICE = process.env.SERVICE_NAME || "service-a";
 const ROLE = process.env.SERVICE_ROLE || "web";
 const IMAGE_TAG = process.env.IMAGE_TAG || "dev";
